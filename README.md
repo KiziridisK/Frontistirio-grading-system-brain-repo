@@ -61,8 +61,16 @@ GradeCategory (e.g. "High School")        — superadmin creates
   course_id: ObjectId → Course,
   period_id: ObjectId → TeachingPeriod,
   store_id: ObjectId → Store,
-  grade: Mixed,     // Number or String depending on grade_scale
+  score: Mixed,           // the numeric/string score (NOT "grade" — see bugs GR-01)
+  comment: Mixed,         // free-text performance comment
+  visible: Boolean,       // student-visibility flag (still unused end-to-end)
+  period_timeline: Mixed (required),  // the cell key, e.g. "2024-3" / "trimester-1"
+  // --- Approval workflow (added 2026-07-06) ---
+  status: "approved" | "pending" (default "approved"),
+  submittedBy: ObjectId → User,   // teacher who proposed a pending change
+  submittedAt: Date,
   createdBy/updatedBy: ObjectId → User,
+  isDeleted: Boolean, deletedAt: Date,
   timestamps: true
 }
 ```
@@ -109,6 +117,11 @@ GradeCategory (e.g. "High School")        — superadmin creates
 |---|---|---|
 | GET | `/student-course-grades/get-store-student-course-grades` | store-user |
 | POST | `/student-course-grades/upsert-store-student-course-grades` | store-user |
+| POST | `/student-course-grades/submit-student-course-grade` | **teacher** (approval workflow) |
+| GET | `/student-course-grades/get-pending-course-grades` | store-user (approval workflow) |
+| GET | `/student-course-grades/get-pending-course-grades-count` | store-user (approval workflow) |
+| POST | `/student-course-grades/approve-course-grade` | store-user (approval workflow) |
+| POST | `/student-course-grades/reject-course-grade` | store-user (approval workflow) |
 
 ---
 
@@ -142,6 +155,56 @@ exports.watchGrades(io, userSockets)   // Change Stream
 ## Backend: `watchGrades`
 - Emits `gradeAdded`, `gradeUpdated`, `gradeDeleted` to all store-users of the affected store
 - Same pattern as other watchers
+
+---
+
+## Grade & Comment Approval Workflow (added 2026-07-06)
+
+Lets teachers submit course grades/comments that an admin (store-user) must approve before they count,
+gated by a store setting. Ahead of the (future) teacher view; the teacher-facing submit UI is deferred but
+the backend submit endpoint is built and API-testable.
+
+**Design (status-flag model, NOT a separate collection):** approval state lives on the existing
+`StudentCourseGrade` via `status` + `submittedBy` + `submittedAt`. A teacher's pending submission
+**overwrites the cell's current value** and marks it `pending`; the prior approved value is NOT preserved
+(no history — accepted tradeoff). Admin approve → `approved`; reject → soft-delete.
+
+**Store setting:** `StoreSettings.require_grade_approval` (Boolean, default false) — see the
+`store-management` brain. When OFF, teacher submissions apply directly as `approved`.
+
+**Backend flow:**
+- `submitStudentCourseGrade` (controller, `isTeacher`): store_id from `req.user.store`; reads
+  `require_grade_approval`; upserts the cell with `status:"pending"` + `submittedBy`/`submittedAt` when ON,
+  else `approved`. Reuses the same find-or-create-or-update logic as the admin upsert;
+  `createStoreStudentCourseGrades` gained a trailing `extra = { status, submittedBy, submittedAt }` arg and
+  `updateStudentCourseGrade`'s whitelist gained `status/submittedBy/submittedAt/isDeleted/deletedAt`.
+- `getPendingCourseGrades` / `getPendingCourseGradesCount` (`isStoreUser`): handler queries
+  `{ store_id, period_id: activePeriod, status:"pending", isDeleted:false }` (new handler exports
+  `getPendingStoreCourseGrades` + `countPendingStoreCourseGrades`).
+- `approveCourseGrade` (`isStoreUser`): body `{ grade_id, score?, comment? }` → optional edit + `status:"approved"`, clears `submittedBy/submittedAt`.
+- `rejectCourseGrade` (`isStoreUser`): soft-deletes the record (`isDeleted:true`).
+- **Fixed bug GR-02 in passing:** `getStoreStudentCourseGrades` now filters `isDeleted:false`, so rejected
+  (soft-deleted) grades disappear from the gradebook.
+
+**Frontend (Frontistirio):**
+- `CourseGrade` model gained `status`, `submittedBy`, `submittedAt`. `Teacher` model gained `user_id?`
+  (to resolve `submittedBy` → teacher name). `StoreSettings` model gained `require_grade_approval?`.
+- `CourseGradeService`: `submitStudentCourseGrade` (teacher, future UI), `getPendingCourseGrades`,
+  `getPendingCourseGradesCount`, `approveCourseGrade(grade_id, score?, comment?)`, `rejectCourseGrade(grade_id)`.
+- New standalone `GradeApprovalsComponent` at `/grade-approvals` (RoleGuard `['store-user']`): pending list,
+  resolves student/course/teacher names + grade scale from NgRx, inline edit via the existing
+  `GradePopoverComponent`/`CommentPopoverComponent`, Approve/Reject. period_timeline keys prettified
+  client-side (`formatPeriodKey`).
+- Settings toggle: `ion-toggle` bound to `store_settings.require_grade_approval` in
+  `SetCourseSettingsComponent` (saves through the existing `upsertStoreSettings`).
+- Home dashboard: `home.page.ts` fetches `getPendingCourseGradesCount()` once for store-user →
+  red `ion-badge` on a new "Grade approvals" STUDIES card. **Simple count-on-load — no websocket/push.**
+- i18n `menu.management.grade_approvals`, `course_settings.{grading_title,require_grade_approval,+hint}`,
+  `course_grades.{no_pending,approve,reject,submitted_by}`, `messages.{grade_approved,grade_rejected,grade_action_failed}`.
+
+**Deferred (with the teacher view):** teacher submit screen; realtime/push for pending (a
+`watchStudentCourseGrades` change-stream badge like `watchAnnouncements`); restoring the prior approved
+value on reject.
 
 ---
 
@@ -203,7 +266,15 @@ getCourseGrades(courseId, studentIds)
 
 upsertCourseGrade(grade)
   → POST /student-course-grades/upsert-store-student-course-grades
-  body: { student_id, course_id, grade, period_id }
+  body: { student_id, course_id, period_key, score, comment }   // NOT "grade"/"period_id" — see bugs GR-01
+
+// Approval workflow (2026-07-06):
+submitStudentCourseGrade(student_id, course_id, period_key, score?, comment?)
+  → POST /student-course-grades/submit-student-course-grade      // teacher; pending vs approved by store setting
+getPendingCourseGrades()          → GET  /student-course-grades/get-pending-course-grades
+getPendingCourseGradesCount()     → GET  /student-course-grades/get-pending-course-grades-count
+approveCourseGrade(grade_id, score?, comment?)  → POST /student-course-grades/approve-course-grade
+rejectCourseGrade(grade_id)       → POST /student-course-grades/reject-course-grade
 ```
 
 ---
