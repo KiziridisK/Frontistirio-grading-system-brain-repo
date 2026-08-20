@@ -118,6 +118,7 @@ GradeCategory (e.g. "High School")        — superadmin creates
 | GET | `/student-course-grades/get-store-student-course-grades` | store-user |
 | POST | `/student-course-grades/upsert-store-student-course-grades` | store-user |
 | POST | `/student-course-grades/submit-student-course-grade` | **teacher** (approval workflow) |
+| GET | `/student-course-grades/get-teacher-student-course-grades` | **teacher** — read a course's grades for the gradebook (added 2026-07-06) |
 | GET | `/student-course-grades/get-pending-course-grades` | store-user (approval workflow) |
 | GET | `/student-course-grades/get-pending-course-grades-count` | store-user (approval workflow) |
 | POST | `/student-course-grades/approve-course-grade` | store-user (approval workflow) |
@@ -202,7 +203,23 @@ the backend submit endpoint is built and API-testable.
 - i18n `menu.management.grade_approvals`, `course_settings.{grading_title,require_grade_approval,+hint}`,
   `course_grades.{no_pending,approve,reject,submitted_by}`, `messages.{grade_approved,grade_rejected,grade_action_failed}`.
 
-**Deferred (with the teacher view):** teacher submit screen; realtime/push for pending (a
+### Teacher gradebook wired up (2026-07-06 — the "future teacher view" is now here)
+The teacher-facing submit UI is **no longer deferred**: `CourseGradeItemComponent` (`/course-grades/:id`,
+route roles += `teacher`) is now **role-aware** (reads `role` from `localStorage.user`):
+- **Read:** teacher → `getTeacherStudentCourseGrades(student_ids, course_id)` (→ new
+  `get-teacher-student-course-grades`), store-user → the existing `getStudentCourseGrades`. Same response shape.
+- **Write:** a shared `persistGrade(studentId, periodKey, score, comment)` calls `submitStudentCourseGrade`
+  (teacher; toasts `grade_submitted_pending` vs `grade_submitted_approved` from the returned `status`) or
+  the direct `upsertStudentCourseGrade` (store-user).
+- Teachers reach the gradebook from the new `/my-teaching` **Courses** tab (see teacher-management brain).
+- **Ownership (server-side, added this session):** `submitStudentCourseGrade` AND the new read controller
+  now validate `course_id ∈ teacher.period_courses[defaultPeriod]` via
+  `teacherHandler.getTeacherByUserId` + `getTeacherPeriodAssignmentIds` (throws
+  `course_not_assigned_to_teacher`). A shared `resolveTeacherForCourse(req, course_id)` helper in
+  `controllers/student-course-grade.js` does the resolve+assert.
+- i18n added: `messages.grade_submitted_{pending,approved}`.
+
+**Deferred (still):** realtime/push for pending (a
 `watchStudentCourseGrades` change-stream badge like `watchAnnouncements`); restoring the prior approved
 value on reject.
 
@@ -297,6 +314,7 @@ Form for name + description. Superadmin only.
 Lists all courses. Click a course → `CourseGradeItemComponent`.
 
 ### `CourseGradeItemComponent` (`/course-grades/:id`) — 12KB TS + 1.3KB HTML
+- **Now role-aware** (store-user + teacher) — see "Teacher gradebook wired up" above.
 - Receives `courseId` from route
 - Fetches all students enrolled in the course for active period (from NgRx)
 - Calls `getCourseGrades(courseId, studentIds)` → grouped grade records
