@@ -4,6 +4,68 @@
 
 ---
 
+## Change log
+
+> Recorded 2026-09-14, verified against code. Older sections below describe the June/July design.
+
+### 2026-09-13 — Scale & scenario on the τάξη (`Grade`) itself
+API `c5942d3`, frontend `384c942`.
+- `models/grades.js` gained **`grade_scale: ObjectId → GradeScale`** and **`grade_scenario: ObjectId →
+  GradeScenarios`** — the same collections a Course references. The old numeric `gradingScale` /
+  `gradingScenario` fields (ids of a hardcoded client-side list, never read anywhere) are kept only so
+  legacy documents load; they are marked legacy in both model files.
+- `handlers/grades.js`: `createStoreGrade` casts the two ids (or leaves them `undefined`);
+  `editStoreGrade` turns a cleared value (`''`/`null`) into `null` because `''` can't cast to an
+  ObjectId.
+- Frontend: `Grade` model `grade_scale?/grade_scenario?: string | null`; the redesigned
+  `add-grade` form-modal (`.fm-*` shell) shows two single-choice chip groups ("Κλίμακα βαθμολόγησης" /
+  "Σενάριο βαθμολόγησης") when scales/scenarios exist, with click-again-to-clear (`toggleChoice`).
+- ⚠️ **Stored, not yet consumed**: nothing reads `Grade.grade_scale/grade_scenario` — courses still
+  carry their own `grade_scale`/`grade_scenario`, the gradebook reads the course's, and a new course
+  is not defaulted from its τάξη. Intended as the τάξη-level default; wiring is a follow-up.
+
+### 2026-09-12 — Period coverage in labels + student grades page redesign + `/my-syllabus`
+Frontend only (`384c942`).
+- **`shared/period-timeline.util.ts` → `formatPeriodTimeline(key, translate, range?)`**: the optional
+  `range: { from, to }` (a TeachingPeriod's `date_from/date_to`) makes non-monthly keys spell out the
+  months they cover — `trimester-1` → **«Τριμηνιαία 1 (Ιούνιος 2026 – Αύγουστος 2026)»**. The months are
+  reconstructed with the **same algorithm as the gradebook's `CourseGradeItemComponent.generatePeriods`**:
+  `ceil(totalMonths / count)` months per slice, count = `trimester 3 / quarter 4 / semester 2`, last
+  slice clamped to `to`; a one-month slice shows a single month. Without `range` the bare label is
+  returned (back-compat). Monthly keys (`"2026-9"`) → «Σεπτέμβριος 2026» as before.
+  `periodTimelineSortValue(key)` orders rows.
+  - Callers passing the default period's span: `student/my-grades`, `home` (student latest grade),
+    `parent/my-children`, `students/student-performance`, and `grade-approvals` (its private
+    `formatPeriodKey` now delegates to the util; it subscribes to `selectTeachingPeriods`).
+  - Limitation: a key like `trimester-1` stores **no dates**, so the months are always derived from
+    the period's **current** `date_from/date_to` — editing a period's dates relabels old grades. The
+    backend performance-report PDF does not use this labelling.
+- **`/my-grades` redesign** (`student/my-grades/`): hero (period + courses / scores / overall average)
+  → one card per course with average, trend arrow and sparkline → timeline of periods with delta chips
+  (+1.5 / −0.5), «ΝΕΟ» (≤ 7 days) and «Τελευταία» tags, clamped comments; pull-to-refresh, retry on
+  failure, cards for courses without grades yet. Shared chrome `student/_student-shell.scss`
+  (`.student-page`, `.student-hero`, `.course-card`…) and `shared/course-accent.util.ts`
+  `courseAccentClass(courseId)` → `accent-0…7` hashed from the id, so a course keeps one colour on
+  every student page.
+  - **Scores are deliberately not colour-toned** ("good/bad"): the student bootstrap branch doesn't ship
+    `gradeScales`, so a bare 15 could be /20 or /100 — only the movement between periods is coloured.
+- **`/my-syllabus`** (`student/my-syllabus/`, RoleGuard `['student']`): the ύλη tab moved out of
+  `/my-grades` into its own page (menu entry + home quick-access card + cross-links between the two
+  breadcrumb bars). The parent view (`my-children`) keeps its syllabus tab.
+
+### 2026-07-07 — Student sees own grades (`/my-grades`) *(not previously recorded here)*
+- `GET /student-course-grades/get-my-course-grades` (`isStudent`, `// NEW ROUTE`) →
+  `getMyCourseGrades`: the student is resolved **from the login** (`getStudentByUserId(req.user.id,
+  period)`), never from a client id; handler `getStudentOwnCourseGrades(storeId, studentId, periodId)` returns
+  the period's records with **`status ≠ 'pending'`** (also matches legacy docs without the field) and
+  `isDeleted:false`, grouped by `course_id`. The model's `visible` field is unused and not filtered.
+- Frontend: `CourseGradeService.getMyCourseGrades()`, page `student/my-grades/` (course names from
+  `selectAllCourses`, imports `RouterModule` for the breadcrumbs), home **latest-grade** card
+  (`loadMyLatestGrade`, most recent by `updatedAt/createdAt`, score normalised to string so `0`
+  renders), and the first student side-menu section (My grades / Educational material / Announcements).
+
+---
+
 ## Grading System Layers
 
 ```
@@ -30,6 +92,10 @@ GradeCategory (e.g. "High School")        — superadmin creates
   name: String,
   store_id: ObjectId → Store,
   category: ObjectId → GradeCategory,
+  description: String,
+  grade_scale: ObjectId → GradeScale,          // 2026-09-13 (τάξη-level default, not consumed yet)
+  grade_scenario: ObjectId → GradeScenarios,   // 2026-09-13
+  gradingScale: Number, gradingScenario: Number, // legacy, unused
   isDeleted: Boolean, deletedAt: Date,
   createdBy/updatedBy: ObjectId → User
 }
