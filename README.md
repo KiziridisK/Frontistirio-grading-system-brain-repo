@@ -8,6 +8,15 @@
 
 > Recorded 2026-09-14, verified against code. Older sections below describe the June/July design.
 
+### 2026-09-21 — Test grading + performance report documented *(built 07-13 / 07-22, not recorded here until now)*
+Verified against frontend `efc1260` / API `93b4079`. Two new sections at the end of this file:
+- **[Test grading (`TestCourseGrade`)](#test-grading-testcoursegrade--built-2026-07-13)**: grading test-cycle tests,
+  one score per (student, test, course), with the same approval flow.
+- **[Student performance report («Επίδοση»)](#student-performance-report-επίδοση--built-2026-07-22)**: per-student
+  PDF and preview for a month or date range, with trend (slope) + test grades.
+
+Since the admin active-period override, the performance report resolves its period with `resolveActivePeriod`, not with `getStoreDefaultPeriod`.
+
 ### 2026-09-13 — Scale & scenario on the τάξη (`Grade`) itself
 API `c5942d3`, frontend `384c942`.
 - `models/grades.js` gained **`grade_scale: ObjectId → GradeScale`** and **`grade_scenario: ObjectId →
@@ -406,3 +415,109 @@ const grade = grades.find(g => g._id === gradeId); // from NgRx selectAllGrades
 ```
 
 Course-level scores (StudentCourseGrade) are separate and only shown in `CourseGradeItemComponent`.
+
+---
+
+## Test grading (`TestCourseGrade`) — built 2026-07-13
+
+> Verified 2026-09-21 @ frontend `efc1260` / API `93b4079`.
+
+Grades **test-cycle tests** in parallel with course grading. A test is one exam on one day, so the gradeable unit is
+**one score + one comment per (student, test, course)**. There are **no scenario or period columns** (the user's choice).
+A `Test` can have several `course_ids`, so the unit is really (test × course). Participants are the students whose
+active-period courses include that course.
+
+**Approval:** same as course grades. It uses the same store setting **`require_grade_approval`**: a teacher's submission is saved as
+`pending` or `approved`, and an admin write is always `approved`. **Reject = soft-delete the pending cell.**
+
+### Model — `models/test-course-grade.js` (collection `TestCourseGrade`)
+`store_id`, `period_id`, `test_id`, `course_id`, `student_id`, `test_cycle_id` (denormalized), `score`/`comment` (Mixed),
+`status` (`approved` default | `pending`), `submittedBy`/`submittedAt`, `isDeleted`/`deletedAt`, timestamps.
+Indexes: **partial-unique** `{store_id, period_id, test_id, course_id, student_id}` on `isDeleted:false` (the cell)
+and `{store_id, period_id, status}` (approval list + badge).
+
+### Routes — `/test-course-grades` (`routes/test-course-grade.js`, all `// NEW ROUTE`)
+| Path | Guard | Controller |
+|---|---|---|
+| GET `/get-store-test-course-grades` | isStoreUser | `getStoreTestCourseGrades` |
+| GET `/get-teacher-test-course-grades` | isTeacher | `getTeacherTestCourseGrades` |
+| GET `/get-store-gradeable-cycles` | isStoreUser | `getStoreGradeableCycles`: cycle → tests listing |
+| GET `/get-teacher-gradeable-cycles` | isTeacher | `getTeacherGradeableCycles`: only the teacher's courses; no date filter |
+| POST `/upsert-store-test-course-grade` | isStoreUser | `upsertStoreTestCourseGrade`: always `approved` |
+| POST `/submit-test-course-grade` | isTeacher | `submitTestCourseGrade`: `pending`/`approved` from the setting |
+| GET `/get-pending-test-course-grades` (+ `-count`) | isStoreUser | approval list + badge count |
+| POST `/approve-test-course-grade`, `/reject-test-course-grade` | isStoreUser | approve / soft-delete |
+
+Controller helpers: `loadTestOrThrow` checks that `course_id ∈ test.course_ids`. `resolveTeacher`/`resolveTeacherForTestCourse`
+check that the teacher owns the course this period **and** that the course is in the test.
+**Teacher bootstrap does not include `test_cycles`**, which is why the teacher has a separate gradeable-cycles endpoint.
+
+### Frontend
+- `models/test-course-grade.model.ts` (`TestCourseGrade`, `GradeableCycle`, `GradeableTest`) and `services/test-course-grade.service.ts`
+  (reads and writes per role, gradeable cycles, pending/count/approve/reject).
+- **`test-grades/test-grades-list/`** (`@Input() mode: 'store-user' | 'teacher'`): cycle → test day → one tile per course, each linking to the gradebook.
+  It is used in two places:
+  - `/course-grades` (admin) has an `ion-segment` «Μαθήματα | Διαγωνισμοί».
+  - `/my-teaching` (teacher) has a «Διαγωνισμοί» tab (`TESTS`).
+- **`test-grades/test-grade-item/`** → route **`/test-grades/:testId/:courseId`** (store-user, teacher). One row per student with **one**
+  grade cell (`GradePopover`, min/max from `course.grade_scale`) + a comment (`CommentPopover`). A teacher **submits**
+  (toast says pending or approved); an admin **upserts**. `goBack()` = `history.back`, because the list lives on two pages.
+- **`/grade-approvals`** has a second section «Διαγωνισμοί» for pending `TestCourseGrade`s. The home badge
+  (`loadPendingApprovalsCount`) is the sum of course and test pending counts.
+- i18n: `course_grades.{tab_courses,tab_tests}`, `test_grades.*`, `teacher.tabs.tests`.
+
+### Gaps
+- **Students and parents do not see their test grades** anywhere except inside the admin's performance report below.
+- No realtime. Not verified end to end (grading a test, pending → approve/reject, the badge).
+
+---
+
+## Student performance report («Επίδοση») — built 2026-07-22
+
+> Verified 2026-09-21 @ frontend `efc1260` / API `93b4079`.
+
+The admin (store-user only) generates a **report for one student** in the active period, for **one month** or a **date range**.
+It gives a live preview plus a **PDF**, across **all** the student's courses. For each course it shows the **linear-regression trend (slope)**
+of the grades in the range, and it lists the **διαγωνίσματα** (test grades) whose test date falls in the range.
+
+**Key design:** the backend builds **one structure** for both the JSON preview and the PDF, so they cannot drift.
+The same pattern is used by the parent-meetings and absence reports.
+
+### How the builder works — `helpers/buildStudentPerformanceReport.js`
+`buildStudentPerformanceReport({storeId, studentId, period, from, to})`:
+1. Courses = **`getStudentIdPeriodCourseIds`** (the student's own courses ∪ their τμήμα's; see `Frontistirio-course-syllabus-brain-repo` §5).
+2. Grades are keyed by `period_timeline` (`"2024-9"` for monthly, `"trimester-1"` for ranged, depending on the course's `grade_scenario`).
+   **`resolveTimelineKey`** turns each key into a concrete `[start, end]` interval. It mirrors the frontend
+   `CourseGradeItemComponent.generatePeriods` (`SCENARIO_COUNT` trimester 3 / quarter 4 / semester 2). A cell is kept if its interval
+   **overlaps** the selected range.
+3. Only grades with `status ≠ pending` and `isDeleted: false` are used, for both `StudentCourseGrade` and `TestCourseGrade`. This is the same
+   filter as the student and parent views.
+4. **`computeTrend`**: least-squares slope + delta (last − first) + direction up/down/flat (`EPS = 0.05`). It returns `null` when there are fewer
+   than 2 numeric points. A single month usually has one cell per course, so **no trend**. A 3-month range usually shows one.
+5. Tests: `TestCourseGrade` → `Test.date` (+ `TestCycle.description`), filtered by date-in-range, grouped per course.
+Also exports `resolveTimelineKey`, `computeTrend`, `GREEK_MONTHS`.
+
+### PDF — `helpers/createPerformanceReportPdf.js`
+PDFKit + DejaVuSans for Greek. One section per course: trend line (↑/↓/→ + delta + slope), average, grades table
+(Περίοδος | Βαθμός | Σχόλιο), tests table (Ημ/νία | Διαγώνισμα | Βαθμός | Σχόλιο). Page overflow is handled with `heightOfString`.
+
+### Routes — `/performance-reports` (`routes/performance-report.js`, `// NEW ROUTE`, both `isStoreUser`)
+| Path | Controller |
+|---|---|
+| GET `/get-student-performance-report?student_id&from&to` | `getStudentPerformanceReport`: JSON for the preview |
+| POST `/export-student-performance-report` | `exportStudentPerformanceReport`: PDF → S3 `logeion-test-cycle-reports`, prefix `performance-reports/<group>/<store>/`, signed URL valid 60 s |
+
+The period comes from `resolveActivePeriod`. **`parseLocalDate`** parses `"YYYY-MM-DD"` as the **local** start or end of the day
+(not `new Date()`, which is UTC), so the range bounds line up with the locally built cell intervals. Without `from`/`to`, the range is the whole period.
+
+### Frontend
+- **`students/student-performance/`** (standalone; `@Input() student`, `@Input() period`) is loaded in `student-details` under the
+  **`PERFORMANCE`** tab. It is imported in **`app.module.ts`** because `StudentDetailsComponent` is declared in the module, not standalone.
+  It has a Μήνας | Χρονική περίοδος `ion-segment`, `ion-datetime-button` + `ion-modal` pickers limited to the period's `date_from`/`date_to`,
+  a live preview that reloads on every change, and an Export PDF button (`triggerDownload`). Preview labels use `formatPeriodTimeline`.
+- `models/performance-report.model.ts`, `services/performance-report.service.ts`. i18n: top-level `performance.*`.
+
+### Gaps
+- No batch export for all students, and no range across periods (the report covers only the active period).
+- Admin only: students and parents cannot see it.
+- Not verified end to end (preview, trend arrows, PDF download).
